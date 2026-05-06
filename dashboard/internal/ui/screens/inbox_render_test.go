@@ -24,7 +24,7 @@ func TestInboxRender(t *testing.T) {
 	}
 
 	th := theme.NewTheme("catppuccin-latte")
-	m := NewInboxModel(th, entries, 140, 30)
+	m := NewInboxModel(th, entries, nil, 140, 30)
 
 	out := stripANSI(m.View())
 	fmt.Println("\n--- ALL tab (default sort: fit) ---")
@@ -47,7 +47,7 @@ func TestInboxDeleteEmitsMsg(t *testing.T) {
 		{URL: "https://a.example/1", Company: "Acme", Title: "SWE", Location: "NYC", FitTier: 3, FitLabel: "★★★"},
 		{URL: "https://b.example/2", Company: "Beta", Title: "SWE", Location: "Remote", FitTier: 2, FitLabel: "★★"},
 	}
-	m := NewInboxModel(theme.NewTheme("catppuccin-mocha"), entries, 120, 30)
+	m := NewInboxModel(theme.NewTheme("catppuccin-mocha"), entries, nil, 120, 30)
 
 	m, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
 	if cmd == nil {
@@ -86,13 +86,88 @@ func TestInboxDeleteEmitsMsg(t *testing.T) {
 	}
 }
 
+// TestInboxSelectAndBatch covers the full select → batch flow:
+//   - space toggles selection and emits InboxSelectionChangedMsg
+//   - 'b' once arms (no message), 'b' twice emits InboxApplyBatchMsg
+//   - 'A' clears all selections
+func TestInboxSelectAndBatch(t *testing.T) {
+	entries := []model.InboxEntry{
+		{URL: "https://a.example/1", Company: "Acme", Title: "SWE", Location: "NYC", FitTier: 3, FitLabel: "★★★"},
+		{URL: "https://b.example/2", Company: "Beta", Title: "FDE", Location: "Remote", FitTier: 2, FitLabel: "★★"},
+	}
+	m := NewInboxModel(theme.NewTheme("catppuccin-mocha"), entries, nil, 120, 30)
+
+	// Select entry 1 with space.
+	m, cmd := m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})
+	if cmd == nil {
+		t.Fatal("expected selection cmd")
+	}
+	selMsg, ok := cmd().(InboxSelectionChangedMsg)
+	if !ok {
+		t.Fatalf("expected InboxSelectionChangedMsg, got %T", cmd())
+	}
+	if len(selMsg.URLs) != 1 || selMsg.URLs[0] != "https://a.example/1" {
+		t.Errorf("selection URLs = %v, want [a.example/1]", selMsg.URLs)
+	}
+	if !m.selected["https://a.example/1"] {
+		t.Error("entry 1 not in selected set")
+	}
+
+	// First 'b' arms; no command emitted.
+	m, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if cmd != nil {
+		t.Errorf("expected nil cmd on first 'b' (arming), got %T", cmd())
+	}
+	if !m.applyArmed {
+		t.Error("applyArmed not set after first 'b'")
+	}
+
+	// Second 'b' confirms; emits InboxApplyBatchMsg with selected entries.
+	m, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if cmd == nil {
+		t.Fatal("expected apply cmd on second 'b'")
+	}
+	applyMsg, ok := cmd().(InboxApplyBatchMsg)
+	if !ok {
+		t.Fatalf("expected InboxApplyBatchMsg, got %T", cmd())
+	}
+	if len(applyMsg.Entries) != 1 || applyMsg.Entries[0].URL != "https://a.example/1" {
+		t.Errorf("apply entries = %v, want one a.example/1", applyMsg.Entries)
+	}
+	if m.applyArmed {
+		t.Error("applyArmed should be reset after confirm")
+	}
+	if len(m.selected) != 0 {
+		t.Errorf("selection should be cleared after apply, got %d", len(m.selected))
+	}
+}
+
+func TestInboxArmedCancelsOnOtherKey(t *testing.T) {
+	entries := []model.InboxEntry{
+		{URL: "https://a.example/1", Company: "Acme", Title: "SWE", FitTier: 3, FitLabel: "★★★"},
+	}
+	m := NewInboxModel(theme.NewTheme("catppuccin-mocha"), entries, map[string]bool{"https://a.example/1": true}, 120, 30)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if !m.applyArmed {
+		t.Fatal("applyArmed should be set")
+	}
+	// Pressing 'j' (down) should cancel the armed state.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if m.applyArmed {
+		t.Error("applyArmed should be cancelled on non-'b' key")
+	}
+	if !strings.Contains(m.feedback, "cancelled") {
+		t.Errorf("feedback = %q, want contains 'cancelled'", m.feedback)
+	}
+}
+
 // TestInboxUndoEmpty verifies that pressing 'u' with an empty undo stack
 // sets a 'Nothing to undo.' feedback and emits no command.
 func TestInboxUndoEmpty(t *testing.T) {
 	entries := []model.InboxEntry{
 		{URL: "https://a.example/1", Company: "Acme", Title: "SWE", Location: "NYC", FitTier: 3, FitLabel: "★★★"},
 	}
-	m := NewInboxModel(theme.NewTheme("catppuccin-mocha"), entries, 120, 30)
+	m := NewInboxModel(theme.NewTheme("catppuccin-mocha"), entries, nil, 120, 30)
 	m, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("u")})
 	if cmd != nil {
 		t.Errorf("expected nil cmd for empty undo, got %T", cmd())

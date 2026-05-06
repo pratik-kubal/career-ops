@@ -29,6 +29,15 @@ type InboxDeleteEntryMsg struct{ Entry model.InboxEntry }
 // back to the top of pipeline.md's pending section and re-parse.
 type InboxRestoreEntryMsg struct{ Entry model.InboxEntry }
 
+// InboxSelectionChangedMsg notifies the host that the in-memory selection set
+// changed; the host should persist it (e.g., to data/inbox-selected.tsv).
+type InboxSelectionChangedMsg struct{ URLs []string }
+
+// InboxApplyBatchMsg requests the host to queue the given entries for batch
+// processing — write batch/batch-input.tsv, move entries from "## Pendientes"
+// to "### Batch queued", clear persisted selection, and reload the inbox.
+type InboxApplyBatchMsg struct{ Entries []model.InboxEntry }
+
 // PipelineOpenInboxMsg signals that the pipeline screen wants to switch to inbox.
 type PipelineOpenInboxMsg struct{}
 
@@ -67,11 +76,17 @@ type InboxModel struct {
 	height          int
 	theme           theme.Theme
 	recentlyDeleted []model.InboxEntry // undo stack (top = most recent)
-	feedback        string             // transient status line (e.g. "Deleted X. Press u to undo.")
+	feedback        string             // transient status line
+	selected        map[string]bool    // URLs selected for batch processing
+	applyArmed      bool               // true after first 'b'; second press confirms
 }
 
-// NewInboxModel constructs an inbox screen.
-func NewInboxModel(t theme.Theme, entries []model.InboxEntry, width, height int) InboxModel {
+// NewInboxModel constructs an inbox screen with an initial selection set.
+// Pass nil for a fresh empty selection.
+func NewInboxModel(t theme.Theme, entries []model.InboxEntry, selected map[string]bool, width, height int) InboxModel {
+	if selected == nil {
+		selected = map[string]bool{}
+	}
 	m := InboxModel{
 		entries:   entries,
 		sortMode:  inboxSortFit,
@@ -79,6 +94,7 @@ func NewInboxModel(t theme.Theme, entries []model.InboxEntry, width, height int)
 		width:     width,
 		height:    height,
 		theme:     t,
+		selected:  selected,
 	}
 	m.applyFilterAndSort()
 	return m
@@ -108,13 +124,27 @@ func (m InboxModel) CurrentEntry() (model.InboxEntry, bool) {
 }
 
 // WithReloadedData rebuilds the inbox preserving the user's tab/sort/cursor,
-// undo stack, and last-action feedback when possible.
+// undo stack, last-action feedback, and selection set when possible. Selections
+// for URLs no longer in the entry list are dropped.
 func (m InboxModel) WithReloadedData(entries []model.InboxEntry) InboxModel {
 	selectedURL := ""
 	if e, ok := m.CurrentEntry(); ok {
 		selectedURL = e.URL
 	}
-	reloaded := NewInboxModel(m.theme, entries, m.width, m.height)
+	// Prune selections to URLs still present in the new entry list.
+	prunedSelection := map[string]bool{}
+	if len(m.selected) > 0 {
+		valid := map[string]bool{}
+		for _, e := range entries {
+			valid[e.URL] = true
+		}
+		for url := range m.selected {
+			if valid[url] {
+				prunedSelection[url] = true
+			}
+		}
+	}
+	reloaded := NewInboxModel(m.theme, entries, prunedSelection, m.width, m.height)
 	reloaded.activeTab = m.activeTab
 	reloaded.sortMode = m.sortMode
 	reloaded.recentlyDeleted = m.recentlyDeleted
@@ -149,7 +179,14 @@ func (m InboxModel) Update(msg tea.Msg) (InboxModel, tea.Cmd) {
 }
 
 func (m InboxModel) handleKey(msg tea.KeyMsg) (InboxModel, tea.Cmd) {
-	switch msg.String() {
+	key := msg.String()
+	// Any key other than a second 'b' cancels an armed batch confirmation.
+	if m.applyArmed && key != "b" {
+		m.applyArmed = false
+		m.feedback = "Batch apply cancelled."
+	}
+
+	switch key {
 	case "q", "esc":
 		return m, func() tea.Msg { return InboxClosedMsg{} }
 
@@ -259,8 +296,69 @@ func (m InboxModel) handleKey(msg tea.KeyMsg) (InboxModel, tea.Cmd) {
 		m.recentlyDeleted = m.recentlyDeleted[:len(m.recentlyDeleted)-1]
 		m.feedback = fmt.Sprintf("Restored %s — %s.", last.Company, truncateRunes(last.Title, 40))
 		return m, func() tea.Msg { return InboxRestoreEntryMsg{Entry: last} }
+
+	case " ":
+		entry, ok := m.CurrentEntry()
+		if !ok || entry.URL == "" {
+			return m, nil
+		}
+		if m.selected[entry.URL] {
+			delete(m.selected, entry.URL)
+			m.feedback = fmt.Sprintf("Unselected %s — %s. (%d total)", entry.Company, truncateRunes(entry.Title, 30), len(m.selected))
+		} else {
+			m.selected[entry.URL] = true
+			m.feedback = fmt.Sprintf("Selected %s — %s. (%d total)", entry.Company, truncateRunes(entry.Title, 30), len(m.selected))
+		}
+		urls := m.selectedURLs()
+		return m, func() tea.Msg { return InboxSelectionChangedMsg{URLs: urls} }
+
+	case "A":
+		if len(m.selected) == 0 {
+			m.feedback = "No selections to clear."
+			return m, nil
+		}
+		count := len(m.selected)
+		m.selected = map[string]bool{}
+		m.feedback = fmt.Sprintf("Cleared %d selections.", count)
+		return m, func() tea.Msg { return InboxSelectionChangedMsg{URLs: []string{}} }
+
+	case "b":
+		if len(m.selected) == 0 {
+			m.feedback = "Select entries with space first, then press b to batch-apply."
+			return m, nil
+		}
+		if !m.applyArmed {
+			m.applyArmed = true
+			m.feedback = fmt.Sprintf("Press b again to queue %d selected for batch processing.", len(m.selected))
+			return m, nil
+		}
+		m.applyArmed = false
+		entries := m.selectedEntries()
+		m.selected = map[string]bool{}
+		m.feedback = fmt.Sprintf("Queued %d for batch. Run ./batch/batch-runner.sh to process.", len(entries))
+		return m, func() tea.Msg { return InboxApplyBatchMsg{Entries: entries} }
 	}
 	return m, nil
+}
+
+// selectedURLs returns the selected URL set as a slice (unordered).
+func (m InboxModel) selectedURLs() []string {
+	urls := make([]string, 0, len(m.selected))
+	for url := range m.selected {
+		urls = append(urls, url)
+	}
+	return urls
+}
+
+// selectedEntries returns entries (in current display order) that are selected.
+func (m InboxModel) selectedEntries() []model.InboxEntry {
+	out := make([]model.InboxEntry, 0, len(m.selected))
+	for _, e := range m.entries {
+		if m.selected[e.URL] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // applyFilterAndSort filters by activeTab and sorts by sortMode.
@@ -402,7 +500,12 @@ func (m InboxModel) renderSortBar() string {
 	style := lipgloss.NewStyle().Foreground(m.theme.Subtext).Width(m.width).Padding(0, 2)
 	sortLabel := fmt.Sprintf("[Sort: %s]", m.sortMode)
 	count := fmt.Sprintf("%d shown", len(m.filtered))
-	return style.Render(fmt.Sprintf("%s  %s", sortLabel, count))
+	selectedCount := ""
+	if len(m.selected) > 0 {
+		selStyle := lipgloss.NewStyle().Foreground(m.theme.Mauve).Bold(true)
+		selectedCount = "  " + selStyle.Render(fmt.Sprintf("%d selected", len(m.selected)))
+	}
+	return style.Render(fmt.Sprintf("%s  %s%s", sortLabel, count, selectedCount))
 }
 
 func (m InboxModel) renderBody() string {
@@ -428,10 +531,11 @@ func (m InboxModel) renderBody() string {
 func (m InboxModel) renderRow(idx int, e model.InboxEntry) string {
 	pad := lipgloss.NewStyle().Padding(0, 2)
 
+	selW := 4
 	fitW := 5
 	companyW := 20
 	locW := 24
-	titleW := m.width - fitW - companyW - locW - 12
+	titleW := m.width - selW - fitW - companyW - locW - 14
 	if titleW < 20 {
 		titleW = 20
 	}
@@ -443,6 +547,13 @@ func (m InboxModel) renderRow(idx int, e model.InboxEntry) string {
 	case 2:
 		fitColor = m.theme.Yellow
 	}
+	selMark := "[ ]"
+	selColor := m.theme.Subtext
+	if m.selected[e.URL] {
+		selMark = "[*]"
+		selColor = m.theme.Mauve
+	}
+	selStyle := lipgloss.NewStyle().Foreground(selColor).Bold(true).Width(selW)
 	fitStyle := lipgloss.NewStyle().Foreground(fitColor).Bold(true).Width(fitW)
 	companyStyle := lipgloss.NewStyle().Foreground(m.theme.Text).Width(companyW)
 	titleStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext).Width(titleW)
@@ -453,7 +564,8 @@ func (m InboxModel) renderRow(idx int, e model.InboxEntry) string {
 		loc = "—"
 	}
 
-	line := fmt.Sprintf(" %s %s %s %s",
+	line := fmt.Sprintf(" %s %s %s %s %s",
+		selStyle.Render(selMark),
 		fitStyle.Render(truncateRunes(e.FitLabel, fitW)),
 		companyStyle.Render(truncateRunes(e.Company, companyW)),
 		titleStyle.Render(truncateRunes(e.Title, titleW)),
@@ -478,11 +590,13 @@ func (m InboxModel) renderHelp() string {
 	descStyle := lipgloss.NewStyle().Foreground(m.theme.Subtext)
 	brand := lipgloss.NewStyle().Foreground(m.theme.Overlay).Render("career-ops by santifer.io")
 
-	keys := keyStyle.Render("↑↓/jk") + descStyle.Render(" nav  ") +
-		keyStyle.Render("←→/hl") + descStyle.Render(" tabs  ") +
-		keyStyle.Render("s") + descStyle.Render(" sort  ") +
-		keyStyle.Render("o/Enter") + descStyle.Render(" open  ") +
-		keyStyle.Render("d") + descStyle.Render(" delete  ") +
+	keys := keyStyle.Render("↑↓") + descStyle.Render(" nav  ") +
+		keyStyle.Render("←→") + descStyle.Render(" tabs  ") +
+		keyStyle.Render("Space") + descStyle.Render(" select  ") +
+		keyStyle.Render("b") + descStyle.Render(" batch  ") +
+		keyStyle.Render("A") + descStyle.Render(" clear  ") +
+		keyStyle.Render("o") + descStyle.Render(" open  ") +
+		keyStyle.Render("d") + descStyle.Render(" del  ") +
 		keyStyle.Render("u") + descStyle.Render(" undo  ") +
 		keyStyle.Render("r") + descStyle.Render(" refresh  ") +
 		keyStyle.Render("Esc") + descStyle.Render(" back")

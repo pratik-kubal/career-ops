@@ -117,7 +117,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case screens.PipelineOpenInboxMsg:
 		entries := data.ParseInbox(m.careerOpsPath)
-		m.inbox = screens.NewInboxModel(m.theme, entries, m.pipeline.Width(), m.pipeline.Height())
+		valid := map[string]bool{}
+		for _, e := range entries {
+			valid[e.URL] = true
+		}
+		selected, _ := data.PruneSelectedURLs(m.careerOpsPath, valid)
+		m.inbox = screens.NewInboxModel(m.theme, entries, selected, m.pipeline.Width(), m.pipeline.Height())
 		m.state = viewInbox
 		return m, nil
 
@@ -140,6 +145,23 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err := data.RestoreInboxEntry(m.careerOpsPath, msg.Entry.URL); err != nil {
 			fmt.Fprintf(os.Stderr, "WARN: inbox restore failed: %v\n", err)
 		}
+		m.reloadInboxData()
+		return m, nil
+
+	case screens.InboxSelectionChangedMsg:
+		if err := data.SaveSelectedURLs(m.careerOpsPath, msg.URLs); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: inbox selection save failed: %v\n", err)
+		}
+		return m, nil
+
+	case screens.InboxApplyBatchMsg:
+		queued, inputPath, err := data.QueueBatchEntries(m.careerOpsPath, msg.Entries)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: inbox batch queue failed: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Queued %d entries for batch. Input: %s\n", queued, inputPath)
+		}
+		_ = data.SaveSelectedURLs(m.careerOpsPath, nil)
 		m.reloadInboxData()
 		return m, nil
 
