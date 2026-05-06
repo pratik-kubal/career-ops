@@ -322,6 +322,9 @@ func (m PipelineModel) handleKey(msg tea.KeyMsg) (PipelineModel, tea.Cmd) {
 	case "p":
 		return m, func() tea.Msg { return PipelineOpenProgressMsg{} }
 
+	case "i":
+		return m, func() tea.Msg { return PipelineOpenInboxMsg{} }
+
 	case "r":
 		return m, func() tea.Msg { return PipelineRefreshMsg{} }
 
@@ -871,6 +874,7 @@ func (m PipelineModel) renderHelp() string {
 		keyStyle.Render("c") + descStyle.Render(" change  ") +
 		keyStyle.Render("v") + descStyle.Render(" view  ") +
 		keyStyle.Render("p") + descStyle.Render(" progress  ") +
+		keyStyle.Render("i") + descStyle.Render(" inbox  ") +
 		keyStyle.Render("Esc") + descStyle.Render(" quit")
 
 	gap := m.width - lipgloss.Width(keys) - lipgloss.Width(brand) - 2

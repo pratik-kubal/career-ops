@@ -21,6 +21,14 @@ type InboxOpenURLMsg struct{ URL string }
 // InboxRefreshMsg requests a re-parse of pipeline.md.
 type InboxRefreshMsg struct{}
 
+// InboxDeleteEntryMsg requests the host to remove an entry from pipeline.md
+// (moving it to the manually-removed subsection) and re-parse.
+type InboxDeleteEntryMsg struct{ Entry model.InboxEntry }
+
+// InboxRestoreEntryMsg requests the host to restore a previously deleted entry
+// back to the top of pipeline.md's pending section and re-parse.
+type InboxRestoreEntryMsg struct{ Entry model.InboxEntry }
+
 // PipelineOpenInboxMsg signals that the pipeline screen wants to switch to inbox.
 type PipelineOpenInboxMsg struct{}
 
@@ -49,15 +57,17 @@ var inboxSortCycle = []string{inboxSortFit, inboxSortCompany, inboxSortTitle}
 
 // InboxModel is the unevaluated-offers screen sourced from data/pipeline.md.
 type InboxModel struct {
-	entries      []model.InboxEntry
-	filtered     []model.InboxEntry
-	cursor       int
-	scrollOffset int
-	activeTab    int
-	sortMode     string
-	width        int
-	height       int
-	theme        theme.Theme
+	entries         []model.InboxEntry
+	filtered        []model.InboxEntry
+	cursor          int
+	scrollOffset    int
+	activeTab       int
+	sortMode        string
+	width           int
+	height          int
+	theme           theme.Theme
+	recentlyDeleted []model.InboxEntry // undo stack (top = most recent)
+	feedback        string             // transient status line (e.g. "Deleted X. Press u to undo.")
 }
 
 // NewInboxModel constructs an inbox screen.
@@ -97,7 +107,8 @@ func (m InboxModel) CurrentEntry() (model.InboxEntry, bool) {
 	return m.filtered[m.cursor], true
 }
 
-// WithReloadedData rebuilds the inbox preserving the user's tab/sort/cursor when possible.
+// WithReloadedData rebuilds the inbox preserving the user's tab/sort/cursor,
+// undo stack, and last-action feedback when possible.
 func (m InboxModel) WithReloadedData(entries []model.InboxEntry) InboxModel {
 	selectedURL := ""
 	if e, ok := m.CurrentEntry(); ok {
@@ -106,6 +117,8 @@ func (m InboxModel) WithReloadedData(entries []model.InboxEntry) InboxModel {
 	reloaded := NewInboxModel(m.theme, entries, m.width, m.height)
 	reloaded.activeTab = m.activeTab
 	reloaded.sortMode = m.sortMode
+	reloaded.recentlyDeleted = m.recentlyDeleted
+	reloaded.feedback = m.feedback
 	reloaded.applyFilterAndSort()
 	if selectedURL != "" {
 		for i, e := range reloaded.filtered {
@@ -227,6 +240,25 @@ func (m InboxModel) handleKey(msg tea.KeyMsg) (InboxModel, tea.Cmd) {
 
 	case "r":
 		return m, func() tea.Msg { return InboxRefreshMsg{} }
+
+	case "d", "x":
+		entry, ok := m.CurrentEntry()
+		if !ok || entry.URL == "" {
+			return m, nil
+		}
+		m.recentlyDeleted = append(m.recentlyDeleted, entry)
+		m.feedback = fmt.Sprintf("Deleted %s — %s. Press u to undo.", entry.Company, truncateRunes(entry.Title, 40))
+		return m, func() tea.Msg { return InboxDeleteEntryMsg{Entry: entry} }
+
+	case "u":
+		if len(m.recentlyDeleted) == 0 {
+			m.feedback = "Nothing to undo."
+			return m, nil
+		}
+		last := m.recentlyDeleted[len(m.recentlyDeleted)-1]
+		m.recentlyDeleted = m.recentlyDeleted[:len(m.recentlyDeleted)-1]
+		m.feedback = fmt.Sprintf("Restored %s — %s.", last.Company, truncateRunes(last.Title, 40))
+		return m, func() tea.Msg { return InboxRestoreEntryMsg{Entry: last} }
 	}
 	return m, nil
 }
@@ -286,8 +318,8 @@ func (m *InboxModel) adjustScroll() {
 }
 
 func (m InboxModel) bodyHeight() int {
-	// header(1) + tabs(2) + sortbar(1) + help(1) = 5; reserve a little extra.
-	h := m.height - 6
+	// header(1) + tabs(2) + sortbar(1) + feedback(1) + help(1) = 6; reserve extra.
+	h := m.height - 7
 	if h < 3 {
 		h = 3
 	}
@@ -299,9 +331,18 @@ func (m InboxModel) View() string {
 	header := m.renderHeader()
 	tabs := m.renderTabs()
 	sortBar := m.renderSortBar()
+	feedback := m.renderFeedback()
 	body := m.renderBody()
 	help := m.renderHelp()
-	return lipgloss.JoinVertical(lipgloss.Left, header, tabs, sortBar, body, help)
+	return lipgloss.JoinVertical(lipgloss.Left, header, tabs, sortBar, feedback, body, help)
+}
+
+func (m InboxModel) renderFeedback() string {
+	style := lipgloss.NewStyle().Foreground(m.theme.Subtext).Width(m.width).Padding(0, 2)
+	if m.feedback == "" {
+		return style.Render(" ")
+	}
+	return style.Render(m.feedback)
 }
 
 func (m InboxModel) renderHeader() string {
@@ -440,7 +481,9 @@ func (m InboxModel) renderHelp() string {
 	keys := keyStyle.Render("↑↓/jk") + descStyle.Render(" nav  ") +
 		keyStyle.Render("←→/hl") + descStyle.Render(" tabs  ") +
 		keyStyle.Render("s") + descStyle.Render(" sort  ") +
-		keyStyle.Render("o/Enter") + descStyle.Render(" open URL  ") +
+		keyStyle.Render("o/Enter") + descStyle.Render(" open  ") +
+		keyStyle.Render("d") + descStyle.Render(" delete  ") +
+		keyStyle.Render("u") + descStyle.Render(" undo  ") +
 		keyStyle.Render("r") + descStyle.Render(" refresh  ") +
 		keyStyle.Render("Esc") + descStyle.Render(" back")
 

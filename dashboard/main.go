@@ -21,12 +21,14 @@ const (
 	viewPipeline viewState = iota
 	viewReport
 	viewProgress
+	viewInbox
 )
 
 type appModel struct {
 	pipeline        screens.PipelineModel
 	viewer          screens.ViewerModel
 	progress        screens.ProgressModel
+	inbox           screens.InboxModel
 	state           viewState
 	careerOpsPath   string
 	theme           theme.Theme
@@ -38,6 +40,11 @@ func (m *appModel) reloadPipelineData() {
 	metrics := data.ComputeMetrics(apps)
 	m.progressMetrics = data.ComputeProgressMetrics(apps)
 	m.pipeline = m.pipeline.WithReloadedData(apps, metrics)
+}
+
+func (m *appModel) reloadInboxData() {
+	entries := data.ParseInbox(m.careerOpsPath)
+	m.inbox = m.inbox.WithReloadedData(entries)
 }
 
 func (m appModel) Init() tea.Cmd {
@@ -53,6 +60,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.state == viewProgress {
 			m.progress.Resize(msg.Width, msg.Height)
+		}
+		if m.state == viewInbox {
+			m.inbox.Resize(msg.Width, msg.Height)
 		}
 		pm, cmd := m.pipeline.Update(msg)
 		m.pipeline = pm
@@ -105,23 +115,39 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = viewPipeline
 		return m, nil
 
-	case screens.PipelineOpenURLMsg:
-		url := msg.URL
-		return m, func() tea.Msg {
-			var cmd *exec.Cmd
-			switch runtime.GOOS {
-			case "darwin":
-				cmd = exec.Command("open", url)
-			case "linux":
-				cmd = exec.Command("xdg-open", url)
-			case "windows":
-				cmd = exec.Command("cmd", "/c", "start", "", url)
-			default:
-				cmd = exec.Command("xdg-open", url)
-			}
-			_ = cmd.Run()
-			return nil
+	case screens.PipelineOpenInboxMsg:
+		entries := data.ParseInbox(m.careerOpsPath)
+		m.inbox = screens.NewInboxModel(m.theme, entries, m.pipeline.Width(), m.pipeline.Height())
+		m.state = viewInbox
+		return m, nil
+
+	case screens.InboxClosedMsg:
+		m.state = viewPipeline
+		return m, nil
+
+	case screens.InboxRefreshMsg:
+		m.reloadInboxData()
+		return m, nil
+
+	case screens.InboxDeleteEntryMsg:
+		if err := data.DeleteInboxEntry(m.careerOpsPath, msg.Entry.URL); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: inbox delete failed: %v\n", err)
 		}
+		m.reloadInboxData()
+		return m, nil
+
+	case screens.InboxRestoreEntryMsg:
+		if err := data.RestoreInboxEntry(m.careerOpsPath, msg.Entry.URL); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: inbox restore failed: %v\n", err)
+		}
+		m.reloadInboxData()
+		return m, nil
+
+	case screens.InboxOpenURLMsg:
+		return m, openURLCmd(msg.URL)
+
+	case screens.PipelineOpenURLMsg:
+		return m, openURLCmd(msg.URL)
 
 	default:
 		if m.state == viewReport {
@@ -134,9 +160,32 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.progress = pg
 			return m, cmd
 		}
+		if m.state == viewInbox {
+			im, cmd := m.inbox.Update(msg)
+			m.inbox = im
+			return m, cmd
+		}
 		pm, cmd := m.pipeline.Update(msg)
 		m.pipeline = pm
 		return m, cmd
+	}
+}
+
+func openURLCmd(url string) tea.Cmd {
+	return func() tea.Msg {
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", url)
+		case "linux":
+			cmd = exec.Command("xdg-open", url)
+		case "windows":
+			cmd = exec.Command("cmd", "/c", "start", "", url)
+		default:
+			cmd = exec.Command("xdg-open", url)
+		}
+		_ = cmd.Run()
+		return nil
 	}
 }
 
@@ -146,6 +195,8 @@ func (m appModel) View() string {
 		return m.viewer.View()
 	case viewProgress:
 		return m.progress.View()
+	case viewInbox:
+		return m.inbox.View()
 	default:
 		return m.pipeline.View()
 	}

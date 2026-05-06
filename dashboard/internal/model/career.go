@@ -72,3 +72,13 @@ type WeekActivity struct {
 	Week  string // e.g., "2026-W14", "2026-W13"
 	Count int
 }
+
+// InboxEntry is one pending offer parsed from data/pipeline.md.
+type InboxEntry struct {
+	URL      string
+	Company  string
+	Title    string
+	Location string
+	FitTier  int    // 1 (low), 2 (medium), 3 (top)
+	FitLabel string // ★, ★★, ★★★
+}
